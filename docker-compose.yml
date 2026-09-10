@@ -5,7 +5,7 @@
 services:
   funding-radar:
     build: .
-    container_name: agresivo-radar
+    container_name: par-una-pos-radar
     # Carga API keys, tokens de Telegram y AUTO_TRADE desde el .env del host.
     env_file:
       - .env

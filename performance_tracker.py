@@ -22,9 +22,8 @@ from pathlib import Path
 from typing import Any
 
 # Parámetros del paper trading.
-INITIAL_PAPER_CAPITAL = 1500.0    # USDT virtuales (banco base)
+INITIAL_PAPER_CAPITAL = 100.0     # USDT virtuales (banco contable base)
 PAPER_INITIAL_CAPITAL = INITIAL_PAPER_CAPITAL  # alias retrocompatible
-LEGACY_CAPITAL_TO_MIGRATE = 100.0  # banco antiguo a parchear al nuevo base
 PAPER_FEE_PER_LEG = 0.001         # 0.1% taker por pata (market orders)
 PAPER_N_LEGS = 4                  # spot+perp en entrada y en salida
 FUNDING_INTERVAL_S = 8 * 60 * 60  # el funding se liquida cada 8h
@@ -80,12 +79,6 @@ class PerformanceTracker:
         self._start_date = data.get("start_date", self._start_date)
         raw_open = data.get("open_trade")
         self._open = PaperTrade(**raw_open) if raw_open else None
-
-        # Parche de banco: migra el capital base antiguo (100) al nuevo (1500)
-        # conservando el historial. current_capital = 1500 + net_pnl acumulado.
-        if self._initial_capital == LEGACY_CAPITAL_TO_MIGRATE:
-            self._initial_capital = INITIAL_PAPER_CAPITAL
-            self.save()
 
     def save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

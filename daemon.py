@@ -65,12 +65,13 @@ UNIVERSE: list[str] = [
 TIMEFRAME = "15m"
 LOOKBACK_HOURS = 72
 CANDLE_LIMIT = LOOKBACK_HOURS * (60 // 15)     # 72h * 4 = 288 velas
-ENTRY_Z = 2.5                                   # tensión del hilo elástico
-EXIT_Z = 0.5                                    # take-profit: reversión a la media
-STOP_LOSS_Z = 4.0                               # stop-loss estadístico (divergencia)
-MAX_HOLD_HOURS = 48                             # stop-loss temporal
-MAX_OPEN_PAIRS = 8                              # límite de posiciones simultáneas
-RISK_PER_PAIR_PCT = 0.0666                      # ≈100 USDT por par sobre 1500 de banco
+ENTRY_Z = 3.0                                   # tensión del hilo elástico (francotirador)
+EXIT_Z = 1.0                                    # take-profit: reversión rápida a la media
+STOP_LOSS_Z = 4.5                               # stop-loss estadístico (tensión extrema)
+MAX_HOLD_HOURS = 24                             # stop-loss temporal (desatasco rápido)
+MAX_OPEN_PAIRS = 1                              # francotirador: una sola posición activa
+MARGIN_CUSHION_USD = 50.0                       # colchón invisible protegido en Binance
+MIN_NOTIONAL_USD = 20.0                         # nocional mínimo para abrir posición
 SCAN_INTERVAL_SECONDS = 30                      # cadencia del bucle (control fino de la vela 15m)
 RATE_LIMIT_SLEEP = 0.10                         # pausa entre descargas (anti-baneo Binance)
 LEG_NOTIONAL_USD = float(os.getenv("PAIR_NOTIONAL_USD", "50"))  # fallback/riesgo
@@ -97,6 +98,7 @@ class PairPosition:
     leg_notional: float
     entry_ts: float
     max_z: float = 0.0    # |Z| máximo alcanzado durante la vida del trade
+    current_z: float = 0.0  # Z-Score actual contra el mercado (tensión en vivo)
 
     def __post_init__(self) -> None:
         # Compat JSON antiguo: si no traía max_z, lo sembramos con |entry_z|.
@@ -169,7 +171,6 @@ class Daemon:
         self._tracker = PerformanceTracker(PORTFOLIO_STATE_PATH)
         self._positions: dict[str, PairPosition] = {}
         self._load_positions()
-        self._reconcile_position_sizing()
 
         self._scan_count = 0
         self._last_heartbeat = time.time()
@@ -197,28 +198,6 @@ class Daemon:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(path)
-
-    def _reconcile_position_sizing(self) -> None:
-        """Parche único: reescala posiciones abiertas dimensionadas con el banco
-        antiguo (100 USDT) al sizing actual, manteniendo entrada y Z."""
-        target_leg = self._tracker.current_capital * RISK_PER_PAIR_PCT / 2.0
-        if target_leg <= 0:
-            return
-        changed = False
-        for pos in self._positions.values():
-            # Muy por debajo del objetivo => venía del banco viejo; recalibrar.
-            if pos.leg_notional < target_leg * 0.5:
-                old = pos.leg_notional
-                pos.leg_notional = target_leg
-                if pos.entry_price_a > 0:
-                    pos.qty_a = target_leg / pos.entry_price_a
-                if pos.entry_price_b > 0:
-                    pos.qty_b = target_leg / pos.entry_price_b
-                changed = True
-                log.warning("posicion_recalibrada", pair=pos.key,
-                            antiguo=round(old, 2), nuevo=round(target_leg, 2))
-        if changed:
-            self._save_positions()
 
     # ------------------------------------------------------------------ #
     #  Ciclo de vida
@@ -331,6 +310,7 @@ class Daemon:
 
             # Tracking del Z-Score máximo alcanzado (se persiste en el JSON).
             pos.max_z = max(pos.max_z, abs(z))
+            pos.current_z = z
             self._save_positions()
 
             abs_z = abs(z)
@@ -436,15 +416,20 @@ class Daemon:
             active_tickers.add(base_b)
 
     async def _available_capital(self) -> float:
-        """Capital para dimensionar: balance USDT real (AUTO) o capital paper."""
+        """Capital para dimensionar.
+
+        • AUTO_TRADE (real): balance USDT del exchange menos el colchón fijo
+          de 50$ protegido en Binance -> max(0, balance − 50).
+        • Paper: capital contable del tracker (parte de 100$).
+        """
         if self._auto_trade and self._trade_exchange is not None:
             try:
                 bal = await self._trade_exchange.fetch_balance()
                 free = float((bal.get("USDT") or {}).get("free") or 0.0)
-                if free > 0:
-                    return free
+                return max(0.0, free - MARGIN_CUSHION_USD)
             except ccxt_async.BaseError as exc:
                 log.warning("fallo_balance_para_sizing", error=str(exc))
+                return 0.0
         return self._tracker.current_capital
 
     async def _open_position(
@@ -460,13 +445,14 @@ class Daemon:
         if price_a <= 0 or price_b <= 0:
             return
 
-        # Dynamic sizing: 6.6% del capital por par, repartido 50/50 entre patas.
-        capital = await self._available_capital()
-        pair_notional = capital * RISK_PER_PAIR_PCT
-        leg_notional = pair_notional / 2.0
-        if leg_notional <= 0:
-            log.warning("sizing_invalido", capital=capital)
+        # Sizing francotirador: todo el capital disponible como nocional,
+        # repartido 50/50 entre la pata Long y la Short.
+        notional_usd = await self._available_capital()
+        if notional_usd < MIN_NOTIONAL_USD:
+            log.info("apertura_omitida_capital", notional=round(notional_usd, 2))
             return
+        pair_notional = notional_usd
+        leg_notional = pair_notional / 2.0
 
         direction = "SHORT_A_LONG_B" if z > 0 else "LONG_A_SHORT_B"
         pos = PairPosition(
@@ -514,7 +500,7 @@ class Daemon:
             f"🟢 <b>ANOMALÍA DETECTADA</b> {base_a}/{base_b}\n"
             f"Z-Score: {z:+.2f} | Acción: {action}\n"
             f"Notional: {leg_notional:.2f} USDT por pata "
-            f"({RISK_PER_PAIR_PCT * 100:.1f}% del capital, delta-neutral)",
+            f"({pair_notional:.2f} USDT total, delta-neutral)",
         )
         log.warning("PAR_ABIERTO", pair=pos.key, z=round(z, 2),
                     direction=direction, leg_notional=round(leg_notional, 2))
@@ -577,7 +563,10 @@ class Daemon:
         for pos in self._positions.values():
             base_a, base_b = pos.bases
             side = "SHORT/LONG" if pos.direction == "SHORT_A_LONG_B" else "LONG/SHORT"
-            lines.append(f"• {base_a}/{base_b} | {side} | Z entrada {pos.entry_z:+.2f}")
+            lines.append(
+                f"• {base_a}/{base_b} | {side} | "
+                f"Z ent: {pos.entry_z:+.2f} | Z act: {pos.current_z:+.2f}"
+            )
         return "\n".join(lines)
 
     async def _maybe_heartbeat(self, session: aiohttp.ClientSession) -> None:

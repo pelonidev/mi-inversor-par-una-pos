@@ -52,6 +52,7 @@ TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
 PORTFOLIO_STATE_PATH = os.getenv("PORTFOLIO_STATE_PATH", "data/portfolio_state.json")
 PAIRS_STATE_PATH = os.getenv("PAIRS_STATE_PATH", "data/pairs_positions.json")
+MIPUP_STATE_PATH = os.getenv("MIPUP_STATE_PATH", "data/mipup_state.json")
 
 # --- Universo de altcoins de alta liquidez (Binance USDT-M Perpetuos) --------
 UNIVERSE: list[str] = [
@@ -68,6 +69,8 @@ CANDLE_LIMIT = LOOKBACK_HOURS * (60 // 15)     # 72h * 4 = 288 velas
 ENTRY_Z = 3.0                                   # tensión del hilo elástico (francotirador)
 EXIT_Z = 1.0                                    # take-profit: reversión rápida a la media
 STOP_LOSS_Z = 4.5                               # stop-loss estadístico (tensión extrema)
+MAX_Z_VELOCITY = 1.5                            # salto máximo de Z entre dos ciclos (anti-shock)
+SHOCK_COOLDOWN_HOURS = 4                         # cuarentena de un par tras un shock de Z
 MAX_HOLD_HOURS = 24                             # stop-loss temporal (desatasco rápido)
 MAX_OPEN_PAIRS = 1                              # francotirador: una sola posición activa
 MARGIN_CUSHION_USD = 50.0                       # colchón invisible protegido en Binance
@@ -99,6 +102,8 @@ class PairPosition:
     entry_ts: float
     max_z: float = 0.0    # |Z| máximo alcanzado durante la vida del trade
     current_z: float = 0.0  # Z-Score actual contra el mercado (tensión en vivo)
+    current_pnl: float = 0.0  # PnL latente estimado (Mark-to-Market) en USDT
+    force_close: bool = False  # Kill Switch: cerrar en el próximo ciclo
 
     def __post_init__(self) -> None:
         # Compat JSON antiguo: si no traía max_z, lo sembramos con |entry_z|.
@@ -172,6 +177,15 @@ class Daemon:
         self._positions: dict[str, PairPosition] = {}
         self._load_positions()
 
+        # Anti-shock: Z del ciclo anterior por par y cuarentenas activas (par -> expiry ts).
+        self._last_z_scores: dict[str, float] = {}
+        self._cooldowns: dict[str, float] = {}
+
+        # Control por Telegram: pausa del escáner y lista negra de activos/pares.
+        self._is_paused: bool = False
+        self._blacklist: set[str] = set()
+        self._load_mipup_state()
+
         self._scan_count = 0
         self._last_heartbeat = time.time()
         self._session_start = time.time()   # inicio de esta sesión (uptime)
@@ -195,6 +209,28 @@ class Daemon:
         path = Path(PAIRS_STATE_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = [asdict(p) for p in self._positions.values()]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    # ------------------------------------------------------------------ #
+    #  Persistencia del estado de control (pausa + blacklist)
+    # ------------------------------------------------------------------ #
+    def _load_mipup_state(self) -> None:
+        path = Path(MIPUP_STATE_PATH)
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        self._is_paused = bool(raw.get("is_paused", False))
+        self._blacklist = set(raw.get("blacklist", []))
+
+    def _save_mipup_state(self) -> None:
+        path = Path(MIPUP_STATE_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"is_paused": self._is_paused, "blacklist": sorted(self._blacklist)}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(path)
@@ -308,6 +344,16 @@ class Daemon:
             if np.isnan(z):
                 continue
 
+            # Precio actual de cada pata: sirve para Z, Mark-to-Market y cierre.
+            current_price_a = float(prices[pos.sym_a].iloc[-1])
+            current_price_b = float(prices[pos.sym_b].iloc[-1])
+
+            # PnL latente (Mark-to-Market): retorno de cada pata * su nocional,
+            # menos comisiones de entrada (ya pagadas) y de salida (estimadas).
+            gross_est = pos.gross_pnl(current_price_a, current_price_b)
+            fees_est = pos.leg_notional * FEES_PER_TRADE
+            pos.current_pnl = gross_est - fees_est
+
             # Tracking del Z-Score máximo alcanzado (se persiste en el JSON).
             pos.max_z = max(pos.max_z, abs(z))
             pos.current_z = z
@@ -316,7 +362,9 @@ class Daemon:
             abs_z = abs(z)
             held_h = (time.time() - pos.entry_ts) / 3600.0
             reason: str | None = None
-            if abs_z <= EXIT_Z:
+            if getattr(pos, "force_close", False):
+                reason = "Cierre Manual"
+            elif abs_z <= EXIT_Z:
                 reason = "Reversión"
             elif abs_z >= STOP_LOSS_Z:
                 reason = "Stop Estadístico"
@@ -326,9 +374,9 @@ class Daemon:
             log.info("vigilando_par", pair=pos.key, z=round(z, 2),
                      max_z=round(pos.max_z, 2), held_h=round(held_h, 1))
             if reason is not None:
-                price_a = float(prices[pos.sym_a].iloc[-1])
-                price_b = float(prices[pos.sym_b].iloc[-1])
-                await self._close_position(session, pos, price_a, price_b, z, reason)
+                await self._close_position(
+                    session, pos, current_price_a, current_price_b, z, reason
+                )
 
     async def _close_position(
         self,
@@ -382,12 +430,38 @@ class Daemon:
     #  Escaneo de entradas + filtro de shock idiosincrático
     # ------------------------------------------------------------------ #
     async def _scan_for_entries(self, session: aiohttp.ClientSession, prices: pd.DataFrame) -> None:
+        # Estado de pausa: no se abren nuevas posiciones; las salidas se siguen gestionando.
+        if self._is_paused:
+            return
+
+        now = time.time()
         symbols = list(prices.columns)
         anomalies: list[tuple[str, str, float]] = []
         for sym_a, sym_b in combinations(symbols, 2):
             z = compute_zscore(prices[sym_a], prices[sym_b])
-            if not np.isnan(z) and abs(z) >= ENTRY_Z:
-                anomalies.append((sym_a, sym_b, z))
+            if np.isnan(z):
+                continue
+            pair = f"{sym_a}|{sym_b}"
+
+            # Filtro de velocidad de Z: salto anómalo respecto al ciclo anterior (shock).
+            z_velocity = abs(z - self._last_z_scores.get(pair, z))
+            self._last_z_scores[pair] = z
+
+            if abs(z) < ENTRY_Z:
+                continue
+
+            # Par en cuarentena por un shock reciente: se ignora hasta que expire.
+            if self._cooldowns.get(pair, 0.0) > now:
+                continue
+
+            # Shock estructural (noticia/hackeo): no operar y poner el par en cooldown 4h.
+            if z_velocity > MAX_Z_VELOCITY:
+                log.warning("shock_z_detectado", pair=pair, z=round(z, 2),
+                            velocity=round(z_velocity, 2))
+                self._cooldowns[pair] = now + SHOCK_COOLDOWN_HOURS * 3600.0
+                continue
+
+            anomalies.append((sym_a, sym_b, z))
 
         anomalies.sort(key=lambda t: abs(t[2]), reverse=True)
         log.info("scan_completo", anomalias=len(anomalies), ts=time.strftime("%H:%M:%S"))
@@ -406,6 +480,10 @@ class Daemon:
                 break
             base_a = sym_a.split("/")[0]
             base_b = sym_b.split("/")[0]
+            # Lista negra: ignora el par si cualquiera de sus patas o el propio par están vetados.
+            if (base_a in self._blacklist or base_b in self._blacklist
+                    or f"{base_a}/{base_b}" in self._blacklist):
+                continue
             # Filtro de shock idiosincrático: una moneda, una sola exposición.
             if base_a in active_tickers or base_b in active_tickers:
                 continue
@@ -524,17 +602,96 @@ class Daemon:
                     data = await resp.json()
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
-                    text = ((upd.get("message") or {}).get("text") or "").strip().lower()
+                    raw_text = ((upd.get("message") or {}).get("text") or "").strip()
+                    text = raw_text.lower()
                     if text.startswith("/pnl") or text.startswith("/status"):
+                        header = "⏸️ <b>[PAUSADO]</b>\n" if self._is_paused else ""
+                        footer = (
+                            f"\n\n🚫 Blacklist: {', '.join(sorted(self._blacklist))}"
+                            if self._blacklist else ""
+                        )
                         msg = (
+                            f"{header}"
                             f"{self._tracker.format_status()}\n"
                             f"⏱️ Uptime sesión: {self._format_uptime()}\n\n"
                             f"{self._format_open_positions()}"
+                            f"{footer}"
                         )
                         await send_telegram(session, msg)
                         log.info("comando_telegram", cmd=text)
                     elif text.startswith("/trades"):
                         await send_telegram(session, self._tracker.format_trades(5))
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/close"):
+                        if not self._positions:
+                            await send_telegram(session, "No hay posiciones abiertas.")
+                        else:
+                            for pos in self._positions.values():
+                                pos.force_close = True
+                            self._save_positions()
+                            await send_telegram(
+                                session,
+                                "⚠️ Comando recibido. Cerrando posición en el "
+                                "próximo ciclo de mercado (max 30s)...",
+                            )
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/config"):
+                        await send_telegram(
+                            session,
+                            "⚙️ <b>Configuración MIPUP</b>\n"
+                            f"Z-Entrada: {ENTRY_Z}\n"
+                            f"Z-Salida: {EXIT_Z}\n"
+                            f"Z-Stop: {STOP_LOSS_Z}\n"
+                            f"Filtro Shock: {MAX_Z_VELOCITY} ΔZ\n"
+                            "Capital Base: 100 USDT",
+                        )
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/pause"):
+                        self._is_paused = True
+                        self._save_mipup_state()
+                        await send_telegram(
+                            session, "⏸️ Escáner pausado. Solo se gestionan salidas."
+                        )
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/resume"):
+                        self._is_paused = False
+                        self._save_mipup_state()
+                        await send_telegram(session, "▶️ Escáner reanudado.")
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/blacklist"):
+                        args = raw_text.split()[1:]
+                        if not args:
+                            actual = ", ".join(sorted(self._blacklist)) or "vacía"
+                            await send_telegram(session, f"🚫 Lista negra actual: {actual}")
+                        elif args[0].lower() == "remove" and len(args) >= 2:
+                            sym = args[1].upper()
+                            self._blacklist.discard(sym)
+                            self._save_mipup_state()
+                            await send_telegram(
+                                session, f"✅ {sym} eliminado de la lista negra."
+                            )
+                        else:
+                            sym = args[0].upper()
+                            self._blacklist.add(sym)
+                            self._save_mipup_state()
+                            await send_telegram(
+                                session,
+                                f"🚫 {sym} (y sus pares) añadidos a la lista negra.",
+                            )
+                        log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/help"):
+                        await send_telegram(
+                            session,
+                            "🤖 <b>Manual de Comandos MIPUP</b> 🤖\n"
+                            "🔹 <code>/status</code> - Estado en vivo, Z-Scores y PnL latente.\n"
+                            "🔹 <code>/config</code> - Muestra los parámetros de riesgo actuales.\n"
+                            "🔹 <code>/close</code> - Cierra la posición activa inmediatamente.\n"
+                            "🔹 <code>/pause</code> - Pausa el escáner (no abre nuevas posiciones).\n"
+                            "🔹 <code>/resume</code> - Reanuda el escáner de Z-Scores.\n"
+                            "🔹 <code>/blacklist [TOKEN]</code> - Añade una moneda a la lista negra (ej. /blacklist SOL).\n"
+                            "🔹 <code>/blacklist remove [TOKEN]</code> - Quita una moneda de la lista negra.\n"
+                            "🔹 <code>/help</code> - Muestra este mensaje.",
+                        )
                         log.info("comando_telegram", cmd=text)
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 await asyncio.sleep(5)
@@ -565,7 +722,8 @@ class Daemon:
             side = "SHORT/LONG" if pos.direction == "SHORT_A_LONG_B" else "LONG/SHORT"
             lines.append(
                 f"• {base_a}/{base_b} | {side} | "
-                f"Z ent: {pos.entry_z:+.2f} | Z act: {pos.current_z:+.2f}"
+                f"Z ent: {pos.entry_z:+.2f} | Z act: {pos.current_z:+.2f} | "
+                f"PnL Est: {pos.current_pnl:+.2f} USDT"
             )
         return "\n".join(lines)
 
